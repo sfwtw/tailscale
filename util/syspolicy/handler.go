@@ -6,11 +6,12 @@ package syspolicy
 import (
 	"errors"
 	"sync/atomic"
+	"testing"
 )
 
 var (
-	handlerUsed atomic.Bool
-	handler     Handler = defaultHandler{}
+	policyHandlerUsed atomic.Bool
+	policyHandler     Handler = defaultHandler{}
 )
 
 // Handler reads system policies from OS-specific storage.
@@ -43,7 +44,7 @@ func (defaultHandler) ReadBoolean(_ string) (bool, error) {
 
 // markHandlerInUse is called before handler methods are called.
 func markHandlerInUse() {
-	handlerUsed.Store(true)
+	policyHandlerUsed.Store(true)
 }
 
 // RegisterHandler initializes the policy handler and ensures registration will happen once.
@@ -51,8 +52,15 @@ func RegisterHandler(h Handler) {
 	// Technically this assignment is not concurrency safe, but in the
 	// event that there was any risk of a data race, we will panic due to
 	// the CompareAndSwap failing.
-	handler = h
-	if !handlerUsed.CompareAndSwap(false, true) {
+	policyHandler = h
+	if !policyHandlerUsed.CompareAndSwap(false, true) {
 		panic("handler was already used before registration")
 	}
+}
+
+func SetHandlerForTest(tb testing.TB, h Handler) {
+	tb.Helper()
+	oldHandler := policyHandler
+	policyHandler = h
+	tb.Cleanup(func() { policyHandler = oldHandler })
 }
