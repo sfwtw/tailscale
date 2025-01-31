@@ -13,11 +13,6 @@ import (
 	"tailscale.com/net/tsaddr"
 )
 
-var (
-	ipv4default = netip.MustParsePrefix("0.0.0.0/0")
-	ipv6default = netip.MustParsePrefix("::/0")
-)
-
 func validateViaPrefix(ipp netip.Prefix) error {
 	if !tsaddr.IsViaPrefix(ipp) {
 		return fmt.Errorf("%v is not a 4-in-6 prefix", ipp)
@@ -29,11 +24,12 @@ func validateViaPrefix(ipp netip.Prefix) error {
 	// The first 64 bits of a are the via prefix.
 	// The next 32 bits are the "site ID".
 	// The last 32 bits are the IPv4.
-	// For now, we reserve the top 3 bytes of the site ID,
-	// and only allow users to use site IDs 0-255.
+	//
+	// We used to only allow advertising site IDs from 0-255, but we have
+	// since relaxed this (as of 2024-01) to allow IDs from 0-65535.
 	siteID := binary.BigEndian.Uint32(a[8:12])
-	if siteID > 0xFF {
-		return fmt.Errorf("route %v contains invalid site ID %08x; must be 0xff or less", ipp, siteID)
+	if siteID > 0xFFFF {
+		return fmt.Errorf("route %v contains invalid site ID %08x; must be 0xffff or less", ipp, siteID)
 	}
 	return nil
 }
@@ -59,22 +55,22 @@ func CalcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]
 					return nil, err
 				}
 			}
-			if ipp == ipv4default {
+			if ipp == tsaddr.AllIPv4() {
 				default4 = true
-			} else if ipp == ipv6default {
+			} else if ipp == tsaddr.AllIPv6() {
 				default6 = true
 			}
 			routeMap[ipp] = true
 		}
 		if default4 && !default6 {
-			return nil, fmt.Errorf("%s advertised without its IPv6 counterpart, please also advertise %s", ipv4default, ipv6default)
+			return nil, fmt.Errorf("%s advertised without its IPv6 counterpart, please also advertise %s", tsaddr.AllIPv4(), tsaddr.AllIPv6())
 		} else if default6 && !default4 {
-			return nil, fmt.Errorf("%s advertised without its IPv4 counterpart, please also advertise %s", ipv6default, ipv4default)
+			return nil, fmt.Errorf("%s advertised without its IPv4 counterpart, please also advertise %s", tsaddr.AllIPv6(), tsaddr.AllIPv4())
 		}
 	}
 	if advertiseDefaultRoute {
-		routeMap[netip.MustParsePrefix("0.0.0.0/0")] = true
-		routeMap[netip.MustParsePrefix("::/0")] = true
+		routeMap[tsaddr.AllIPv4()] = true
+		routeMap[tsaddr.AllIPv6()] = true
 	}
 	if len(routeMap) == 0 {
 		return nil, nil

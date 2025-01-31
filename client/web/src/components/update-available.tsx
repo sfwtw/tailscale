@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import React from "react"
-import { VersionInfo } from "src/hooks/self-update"
+import { VersionInfo } from "src/types"
 import Button from "src/ui/button"
+import Card from "src/ui/card"
 import { useLocation } from "wouter"
 
 export function UpdateAvailableNotification({
@@ -14,7 +15,7 @@ export function UpdateAvailableNotification({
   const [, setLocation] = useLocation()
 
   return (
-    <div className="card">
+    <Card>
       <h2 className="mb-2">
         Update available{" "}
         {details.LatestVersion && `(v${details.LatestVersion})`}
@@ -32,7 +33,7 @@ export function UpdateAvailableNotification({
       >
         Update now
       </Button>
-    </div>
+    </Card>
   )
 }
 
@@ -60,7 +61,7 @@ export function ChangelogText({ version }: { version?: string }) {
       <a href="https://tailscale.com/changelog/" className="link">
         release notes
       </a>{" "}
-      to find out what's new!
+      to find out what’s new!
     </>
   )
 }

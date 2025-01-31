@@ -3,22 +3,23 @@
 
 import cx from "classnames"
 import React, { useMemo } from "react"
-import { ReactComponent as ArrowRight } from "src/assets/icons/arrow-right.svg"
-import { ReactComponent as Machine } from "src/assets/icons/machine.svg"
+import { apiFetch } from "src/api"
+import ArrowRight from "src/assets/icons/arrow-right.svg?react"
+import Machine from "src/assets/icons/machine.svg?react"
 import AddressCard from "src/components/address-copy-card"
 import ExitNodeSelector from "src/components/exit-node-selector"
-import { NodeData, NodeUpdaters } from "src/hooks/node-data"
+import { AuthResponse, canEdit } from "src/hooks/auth"
+import { NodeData } from "src/types"
+import Card from "src/ui/card"
 import { pluralize } from "src/utils/util"
 import { Link, useLocation } from "wouter"
 
 export default function HomeView({
-  readonly,
   node,
-  nodeUpdaters,
+  auth,
 }: {
-  readonly: boolean
   node: NodeData
-  nodeUpdaters: NodeUpdaters
+  auth: AuthResponse
 }) {
   const [allSubnetRoutes, pendingSubnetRoutes] = useMemo(
     () => [
@@ -31,14 +32,16 @@ export default function HomeView({
   return (
     <div className="mb-12 w-full">
       <h2 className="mb-3">This device</h2>
-      <div className="-mx-5 card mb-9">
+      <Card noPadding className="-mx-5 p-5 mb-9">
         <div className="flex justify-between items-center text-lg mb-5">
           <Link className="flex items-center" to="/details">
             <div className="w-10 h-10 bg-gray-100 rounded-full justify-center items-center inline-flex">
               <Machine />
             </div>
             <div className="ml-3">
-              <h1>{node.DeviceName}</h1>
+              <div className="text-gray-800 text-lg font-medium leading-snug">
+                {node.DeviceName}
+              </div>
               <p className="text-gray-500 text-sm leading-[18.20px] flex items-center gap-2">
                 <span
                   className={cx("w-2 h-2 inline-block rounded-full", {
@@ -64,14 +67,17 @@ export default function HomeView({
           <ExitNodeSelector
             className="mb-5"
             node={node}
-            nodeUpdaters={nodeUpdaters}
-            disabled={readonly}
+            disabled={!canEdit("exitnodes", auth)}
           />
         )}
-        <Link className="link font-medium" to="/details">
+        <Link
+          className="link font-medium"
+          to="/details"
+          onClick={() => apiFetch("/device-details-click", "POST")}
+        >
           View device details &rarr;
         </Link>
-      </div>
+      </Card>
       <h2 className="mb-3">Settings</h2>
       <div className="grid gap-3">
         {node.Features["advertise-routes"] && (
@@ -110,9 +116,7 @@ export default function HomeView({
               node.RunningSSHServer
                 ? {
                     text: "Running",
-                    icon: (
-                      <div className="w-2 h-2 bg-emerald-500 rounded-full" />
-                    ),
+                    icon: <div className="w-2 h-2 bg-green-300 rounded-full" />,
                   }
                 : undefined
             }
@@ -150,37 +154,36 @@ function SettingsCard({
   const [, setLocation] = useLocation()
 
   return (
-    <button
-      className={cx("-mx-5 card cursor-pointer", { "pb-4": footer }, className)}
-      onClick={() => setLocation(link)}
-    >
-      <div className="flex justify-between items-center">
-        <div>
-          <div className="flex gap-2">
-            <p className="text-gray-800 font-medium leading-tight mb-2">
-              {title}
-            </p>
-            {badge && (
-              <div className="h-5 px-2 bg-gray-100 rounded-full flex items-center gap-2">
-                {badge.icon}
-                <div className="text-gray-500 text-xs font-medium">
-                  {badge.text}
+    <button onClick={() => setLocation(link)}>
+      <Card noPadding className={cx("-mx-5 p-5", className)}>
+        <div className="flex justify-between items-center">
+          <div>
+            <div className="flex gap-2">
+              <p className="text-gray-800 font-medium leading-tight mb-2">
+                {title}
+              </p>
+              {badge && (
+                <div className="h-5 px-2 bg-gray-100 rounded-full flex items-center gap-2">
+                  {badge.icon}
+                  <div className="text-gray-500 text-xs font-medium">
+                    {badge.text}
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
+            <p className="text-gray-500 text-sm leading-tight">{body}</p>
           </div>
-          <p className="text-gray-500 text-sm leading-tight">{body}</p>
+          <div>
+            <ArrowRight className="ml-3" />
+          </div>
         </div>
-        <div>
-          <ArrowRight className="ml-3" />
-        </div>
-      </div>
-      {footer && (
-        <>
-          <hr className="my-3" />
-          <div className="text-gray-500 text-sm leading-tight">{footer}</div>
-        </>
-      )}
+        {footer && (
+          <>
+            <hr className="my-3" />
+            <div className="text-gray-500 text-sm leading-tight">{footer}</div>
+          </>
+        )}
+      </Card>
     </button>
   )
 }

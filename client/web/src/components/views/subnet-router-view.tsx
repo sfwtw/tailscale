@@ -1,26 +1,29 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+import cx from "classnames"
 import React, { useCallback, useMemo, useState } from "react"
-import { ReactComponent as CheckCircle } from "src/assets/icons/check-circle.svg"
-import { ReactComponent as Clock } from "src/assets/icons/clock.svg"
-import { ReactComponent as Plus } from "src/assets/icons/plus.svg"
+import { useAPI } from "src/api"
+import CheckCircle from "src/assets/icons/check-circle.svg?react"
+import Clock from "src/assets/icons/clock.svg?react"
+import Plus from "src/assets/icons/plus.svg?react"
 import * as Control from "src/components/control-components"
-import { NodeData, NodeUpdaters } from "src/hooks/node-data"
+import { NodeData } from "src/types"
 import Button from "src/ui/button"
 import Card from "src/ui/card"
+import Dialog from "src/ui/dialog"
 import EmptyState from "src/ui/empty-state"
 import Input from "src/ui/input"
 
 export default function SubnetRouterView({
   readonly,
   node,
-  nodeUpdaters,
 }: {
   readonly: boolean
   node: NodeData
-  nodeUpdaters: NodeUpdaters
 }) {
+  const api = useAPI()
+
   const [advertisedRoutes, hasRoutes, hasUnapprovedRoutes] = useMemo(() => {
     const routes = node.AdvertisedRoutes || []
     return [routes, routes.length > 0, routes.find((r) => !r.Approved)]
@@ -30,9 +33,11 @@ export default function SubnetRouterView({
     advertisedRoutes.length === 0 && !readonly
   )
   const [inputText, setInputText] = useState<string>("")
+  const [postError, setPostError] = useState<string>()
 
   const resetInput = useCallback(() => {
     setInputText("")
+    setPostError("")
     setInputOpen(false)
   }, [])
 
@@ -52,7 +57,7 @@ export default function SubnetRouterView({
       </p>
       {!readonly &&
         (inputOpen ? (
-          <div className="-mx-5 card !border-0 shadow-popover">
+          <Card noPadding className="-mx-5 p-5 !border-0 shadow-popover">
             <p className="font-medium leading-snug mb-3">
               Advertise new routes
             </p>
@@ -61,29 +66,43 @@ export default function SubnetRouterView({
               className="text-sm"
               placeholder="192.168.0.0/24"
               value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
+              onChange={(e) => {
+                setPostError("")
+                setInputText(e.target.value)
+              }}
             />
-            <p className="my-2 h-6 text-gray-500 text-sm leading-tight">
-              Add multiple routes by providing a comma-separated list.
+            <p
+              className={cx("my-2 h-6 text-sm leading-tight", {
+                "text-gray-500": !postError,
+                "text-red-400": postError,
+              })}
+            >
+              {postError ||
+                "Add multiple routes by providing a comma-separated list."}
             </p>
             <div className="flex gap-3">
               <Button
                 intent="primary"
                 onClick={() =>
-                  nodeUpdaters
-                    .postSubnetRoutes([
-                      ...advertisedRoutes.map((r) => r.Route),
-                      ...inputText.split(","),
-                    ])
+                  api({
+                    action: "update-routes",
+                    data: [
+                      ...advertisedRoutes,
+                      ...inputText
+                        .split(",")
+                        .map((r) => ({ Route: r, Approved: false })),
+                    ],
+                  })
                     .then(resetInput)
+                    .catch((err: Error) => setPostError(err.message))
                 }
-                disabled={!inputText}
+                disabled={!inputText || postError !== ""}
               >
                 Advertise {hasRoutes && "new "}routes
               </Button>
               {hasRoutes && <Button onClick={resetInput}>Cancel</Button>}
             </div>
-          </div>
+          </Card>
         ) : (
           <Button
             intent="primary"
@@ -96,7 +115,7 @@ export default function SubnetRouterView({
       <div className="-mx-5 mt-10">
         {hasRoutes ? (
           <>
-            <div className="px-5 py-3 bg-white rounded-lg border border-gray-200">
+            <Card noPadding className="px-5 py-3">
               {advertisedRoutes.map((r) => (
                 <div
                   className="flex justify-between items-center pb-2.5 mb-2.5 border-b border-b-gray-200 last:pb-0 last:mb-0 last:border-b-0"
@@ -121,23 +140,21 @@ export default function SubnetRouterView({
                       )}
                     </div>
                     {!readonly && (
-                      <Button
-                        sizeVariant="small"
-                        onClick={() =>
-                          nodeUpdaters.postSubnetRoutes(
-                            advertisedRoutes
-                              .map((it) => it.Route)
-                              .filter((it) => it !== r.Route)
-                          )
+                      <StopAdvertisingDialog
+                        onSubmit={() =>
+                          api({
+                            action: "update-routes",
+                            data: advertisedRoutes.filter(
+                              (it) => it.Route !== r.Route
+                            ),
+                          })
                         }
-                      >
-                        Stop advertising…
-                      </Button>
+                      />
                     )}
                   </div>
                 </div>
               ))}
-            </div>
+            </Card>
             {hasUnapprovedRoutes && (
               <Control.AdminContainer
                 className="mt-3 w-full text-center text-gray-500 text-sm leading-tight"
@@ -158,5 +175,24 @@ export default function SubnetRouterView({
         )}
       </div>
     </>
+  )
+}
+
+function StopAdvertisingDialog({ onSubmit }: { onSubmit: () => void }) {
+  return (
+    <Dialog
+      className="max-w-md"
+      title="Stop advertising route"
+      trigger={<Button sizeVariant="small">Stop advertising…</Button>}
+    >
+      <Dialog.Form
+        cancelButton
+        submitButton="Stop advertising"
+        destructive
+        onSubmit={onSubmit}
+      >
+        Any active connections between devices over this route will be broken.
+      </Dialog.Form>
+    </Dialog>
   )
 }

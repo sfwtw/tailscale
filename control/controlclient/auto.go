@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tailscale.com/health"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
@@ -22,13 +21,14 @@ import (
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/structs"
+	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/execqueue"
 )
 
 type LoginGoal struct {
 	_     structs.Incomparable
-	token *tailcfg.Oauth2Token // oauth token to use when logging in
-	flags LoginFlags           // flags to use when logging in
-	url   string               // auth url that needs to be visited
+	flags LoginFlags // flags to use when logging in
+	url   string     // auth url that needs to be visited
 }
 
 var _ Client = (*Auto)(nil)
@@ -118,7 +118,7 @@ type Auto struct {
 	closed        bool
 	updateCh      chan struct{} // readable when we should inform the server of a change
 	observer      Observer      // called to update Client status; always non-nil
-	observerQueue execQueue
+	observerQueue execqueue.ExecQueue
 
 	unregisterHealthWatch func()
 
@@ -131,6 +131,8 @@ type Auto struct {
 	// lastUpdateGen is the gen of last update we had an update worth sending to
 	// the server.
 	lastUpdateGen updateGen
+
+	lastStatus atomic.Pointer[Status]
 
 	paused         bool        // whether we should stop making HTTP requests
 	unpauseWaiters []chan bool // chans that gets sent true (once) on wake, or false on Shutdown
@@ -194,7 +196,7 @@ func NewNoStart(opts Options) (_ *Auto, err error) {
 	c.mapCtx, c.mapCancel = context.WithCancel(context.Background())
 	c.mapCtx = sockstats.WithSockStats(c.mapCtx, sockstats.LabelControlClientAuto, opts.Logf)
 
-	c.unregisterHealthWatch = health.RegisterWatcher(direct.ReportHealthChange)
+	c.unregisterHealthWatch = opts.HealthTracker.RegisterWatcher(direct.ReportHealthChange)
 	return c, nil
 
 }
@@ -252,14 +254,6 @@ func (c *Auto) updateControl() {
 	}
 }
 
-// cancelAuthCtx cancels the existing auth goroutine's context
-// & creates a new one, causing it to restart.
-func (c *Auto) cancelAuthCtx() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cancelAuthCtxLocked()
-}
-
 // cancelAuthCtxLocked is like cancelAuthCtx, but assumes the caller holds c.mu.
 func (c *Auto) cancelAuthCtxLocked() {
 	if c.authCancel != nil {
@@ -269,14 +263,6 @@ func (c *Auto) cancelAuthCtxLocked() {
 		c.authCtx, c.authCancel = context.WithCancel(context.Background())
 		c.authCtx = sockstats.WithSockStats(c.authCtx, sockstats.LabelControlClientAuto, c.logf)
 	}
-}
-
-// cancelMapCtx cancels the context for the existing mapPoll and liteUpdates
-// goroutines and creates a new one, causing them to restart.
-func (c *Auto) cancelMapCtx() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cancelMapCtxLocked()
 }
 
 // cancelMapCtxLocked is like cancelMapCtx, but assumes the caller holds c.mu.
@@ -331,7 +317,7 @@ func (c *Auto) authRoutine() {
 		}
 
 		if goal == nil {
-			health.SetAuthRoutineInError(nil)
+			c.direct.health.SetAuthRoutineInError(nil)
 			// Wait for user to Login or Logout.
 			<-ctx.Done()
 			c.logf("[v1] authRoutine: context done.")
@@ -354,19 +340,24 @@ func (c *Auto) authRoutine() {
 			url, err = c.direct.WaitLoginURL(ctx, goal.url)
 			f = "WaitLoginURL"
 		} else {
-			url, err = c.direct.TryLogin(ctx, goal.token, goal.flags)
+			url, err = c.direct.TryLogin(ctx, goal.flags)
 			f = "TryLogin"
 		}
 		if err != nil {
-			health.SetAuthRoutineInError(err)
+			c.direct.health.SetAuthRoutineInError(err)
 			report(err, f)
 			bo.BackOff(ctx, err)
 			continue
 		}
 		if url != "" {
-			// goal.url ought to be empty here.
-			// However, not all control servers get this right,
-			// and logging about it here just generates noise.
+			// goal.url ought to be empty here. However, not all control servers
+			// get this right, and logging about it here just generates noise.
+			//
+			// TODO(bradfitz): I don't follow that comment. Our own testcontrol
+			// used by tstest/integration hits this path, in fact.
+			if c.direct.panicOnUse {
+				panic("tainted client")
+			}
 			c.mu.Lock()
 			c.urlToVisit = url
 			c.loginGoal = &LoginGoal{
@@ -388,7 +379,7 @@ func (c *Auto) authRoutine() {
 		}
 
 		// success
-		health.SetAuthRoutineInError(nil)
+		c.direct.health.SetAuthRoutineInError(nil)
 		c.mu.Lock()
 		c.urlToVisit = ""
 		c.loggedIn = true
@@ -518,11 +509,11 @@ func (c *Auto) mapRoutine() {
 			c.logf("[v1] mapRoutine: context done.")
 			continue
 		}
-		health.SetOutOfPollNetMap()
+		c.direct.health.SetOutOfPollNetMap()
 
 		err := c.direct.PollNetMap(ctx, mrs)
 
-		health.SetOutOfPollNetMap()
+		c.direct.health.SetOutOfPollNetMap()
 		c.mu.Lock()
 		c.inMapPoll = false
 		if c.state == StateSynchronized {
@@ -608,32 +599,103 @@ func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkM
 		// not logged in.
 		nm = nil
 	}
-	new := Status{
+	newSt := &Status{
 		URL:     url,
 		Persist: p,
 		NetMap:  nm,
 		Err:     err,
 		state:   state,
 	}
+	c.lastStatus.Store(newSt)
 
 	// Launch a new goroutine to avoid blocking the caller while the observer
 	// does its thing, which may result in a call back into the client.
+	metricQueued.Add(1)
 	c.observerQueue.Add(func() {
-		c.observer.SetControlClientStatus(c, new)
+		if canSkipStatus(newSt, c.lastStatus.Load()) {
+			metricSkippable.Add(1)
+			if !c.direct.controlKnobs.DisableSkipStatusQueue.Load() {
+				metricSkipped.Add(1)
+				return
+			}
+		}
+		c.observer.SetControlClientStatus(c, *newSt)
+
+		// Best effort stop retaining the memory now that we've sent it to the
+		// observer (LocalBackend). We CAS here because the caller goroutine is
+		// doing a Store which we want to win a race. This is only a memory
+		// optimization and is not for correctness.
+		//
+		// If the CAS fails, that means somebody else's Store replaced our
+		// pointer (so mission accomplished: our netmap is no longer retained in
+		// any case) and that Store caller will be responsible for removing
+		// their own netmap (or losing their race too, down the chain).
+		// Eventually the last caller will win this CAS and zero lastStatus.
+		c.lastStatus.CompareAndSwap(newSt, nil)
 	})
 }
 
-func (c *Auto) Login(t *tailcfg.Oauth2Token, flags LoginFlags) {
-	c.logf("client.Login(%v, %v)", t != nil, flags)
+var (
+	metricQueued    = clientmetric.NewCounter("controlclient_auto_status_queued")
+	metricSkippable = clientmetric.NewCounter("controlclient_auto_status_queue_skippable")
+	metricSkipped   = clientmetric.NewCounter("controlclient_auto_status_queue_skipped")
+)
+
+// canSkipStatus reports whether we can skip sending s1, knowing
+// that s2 is enqueued sometime in the future after s1.
+//
+// s1 must be non-nil. s2 may be nil.
+func canSkipStatus(s1, s2 *Status) bool {
+	if s2 == nil {
+		// Nothing in the future.
+		return false
+	}
+	if s1 == s2 {
+		// If the last item in the queue is the same as s1,
+		// we can't skip it.
+		return false
+	}
+	if s1.Err != nil || s1.URL != "" {
+		// If s1 has an error or a URL, we shouldn't skip it, lest the error go
+		// away in s2 or in-between. We want to make sure all the subsystems see
+		// it. Plus there aren't many of these, so not worth skipping.
+		return false
+	}
+	if !s1.Persist.Equals(s2.Persist) || s1.state != s2.state {
+		// If s1 has a different Persist or state than s2,
+		// don't skip it. We only care about skipping the typical
+		// entries where the only difference is the NetMap.
+		return false
+	}
+	// If nothing above precludes it, and both s1 and s2 have NetMaps, then
+	// we can skip it, because s2's NetMap is a newer version and we can
+	// jump straight from whatever state we had before to s2's state,
+	// without passing through s1's state first. A NetMap is regrettably a
+	// full snapshot of the state, not an incremental delta. We're slowly
+	// moving towards passing around only deltas around internally at all
+	// layers, but this is explicitly the case where we didn't have a delta
+	// path for the message we received over the wire and had to resort
+	// to the legacy full NetMap path. And then we can get behind processing
+	// these full NetMap snapshots in LocalBackend/wgengine/magicsock/netstack
+	// and this path (when it returns true) lets us skip over useless work
+	// and not get behind in the queue. This matters in particular for tailnets
+	// that are both very large + very churny.
+	return s1.NetMap != nil && s2.NetMap != nil
+}
+
+func (c *Auto) Login(flags LoginFlags) {
+	c.logf("client.Login(%v)", flags)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return
 	}
+	if c.direct != nil && c.direct.panicOnUse {
+		panic("tainted client")
+	}
 	c.wantLoggedIn = true
 	c.loginGoal = &LoginGoal{
-		token: t,
 		flags: flags,
 	}
 	c.cancelMapCtxLocked()
@@ -648,6 +710,9 @@ func (c *Auto) Logout(ctx context.Context) error {
 	c.wantLoggedIn = false
 	c.loginGoal = nil
 	closed := c.closed
+	if c.direct != nil && c.direct.panicOnUse {
+		panic("tainted client")
+	}
 	c.mu.Unlock()
 
 	if closed {
@@ -684,37 +749,35 @@ func (c *Auto) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 }
 
 func (c *Auto) Shutdown() {
-	c.logf("client.Shutdown()")
-
 	c.mu.Lock()
-	closed := c.closed
-	direct := c.direct
-	if !closed {
-		c.closed = true
-		c.observerQueue.shutdown()
-		c.cancelAuthCtxLocked()
-		c.cancelMapCtxLocked()
-		for _, w := range c.unpauseWaiters {
-			w <- false
-		}
-		c.unpauseWaiters = nil
+	if c.closed {
+		c.mu.Unlock()
+		return
 	}
+	c.logf("client.Shutdown ...")
+
+	direct := c.direct
+	c.closed = true
+	c.observerQueue.Shutdown()
+	c.cancelAuthCtxLocked()
+	c.cancelMapCtxLocked()
+	for _, w := range c.unpauseWaiters {
+		w <- false
+	}
+	c.unpauseWaiters = nil
 	c.mu.Unlock()
 
-	c.logf("client.Shutdown")
-	if !closed {
-		c.unregisterHealthWatch()
-		<-c.authDone
-		<-c.mapDone
-		<-c.updateDone
-		if direct != nil {
-			direct.Close()
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		c.observerQueue.wait(ctx)
-		c.logf("Client.Shutdown done.")
+	c.unregisterHealthWatch()
+	<-c.authDone
+	<-c.mapDone
+	<-c.updateDone
+	if direct != nil {
+		direct.Close()
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.observerQueue.Wait(ctx)
+	c.logf("Client.Shutdown done.")
 }
 
 // NodePublicKey returns the node public key currently in use. This is
@@ -752,96 +815,4 @@ func (c *Auto) DoNoiseRequest(req *http.Request) (*http.Response, error) {
 // payload, if any.
 func (c *Auto) GetSingleUseNoiseRoundTripper(ctx context.Context) (http.RoundTripper, *tailcfg.EarlyNoise, error) {
 	return c.direct.GetSingleUseNoiseRoundTripper(ctx)
-}
-
-type execQueue struct {
-	mu         sync.Mutex
-	closed     bool
-	inFlight   bool          // whether a goroutine is running q.run
-	doneWaiter chan struct{} // non-nil if waiter is waiting, then closed
-	queue      []func()
-}
-
-func (q *execQueue) Add(f func()) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.closed {
-		return
-	}
-	if q.inFlight {
-		q.queue = append(q.queue, f)
-	} else {
-		q.inFlight = true
-		go q.run(f)
-	}
-}
-
-// RunSync waits for the queue to be drained and then synchronously runs f.
-// It returns an error if the queue is closed before f is run or ctx expires.
-func (q *execQueue) RunSync(ctx context.Context, f func()) error {
-	for {
-		if err := q.wait(ctx); err != nil {
-			return err
-		}
-		q.mu.Lock()
-		if q.inFlight {
-			q.mu.Unlock()
-			continue
-		}
-		defer q.mu.Unlock()
-		if q.closed {
-			return errors.New("closed")
-		}
-		f()
-		return nil
-	}
-}
-
-func (q *execQueue) run(f func()) {
-	f()
-
-	q.mu.Lock()
-	for len(q.queue) > 0 && !q.closed {
-		f := q.queue[0]
-		q.queue[0] = nil
-		q.queue = q.queue[1:]
-		q.mu.Unlock()
-		f()
-		q.mu.Lock()
-	}
-	q.inFlight = false
-	q.queue = nil
-	if q.doneWaiter != nil {
-		close(q.doneWaiter)
-		q.doneWaiter = nil
-	}
-	q.mu.Unlock()
-}
-
-func (q *execQueue) shutdown() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.closed = true
-}
-
-// wait waits for the queue to be empty.
-func (q *execQueue) wait(ctx context.Context) error {
-	q.mu.Lock()
-	waitCh := q.doneWaiter
-	if q.inFlight && waitCh == nil {
-		waitCh = make(chan struct{})
-		q.doneWaiter = waitCh
-	}
-	q.mu.Unlock()
-
-	if waitCh == nil {
-		return nil
-	}
-
-	select {
-	case <-waitCh:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }

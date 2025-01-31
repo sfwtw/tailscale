@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"tailscale.com/tailcfg"
+	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
@@ -25,7 +26,7 @@ import (
 	"tailscale.com/version"
 )
 
-//go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=TKAFilteredPeer
+//go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=TKAPeer
 
 // Status represents the entire state of the IPN network.
 type Status struct {
@@ -40,6 +41,9 @@ type Status struct {
 	//  "NoState", "NeedsLogin", "NeedsMachineAuth", "Stopped",
 	//  "Starting", "Running".
 	BackendState string
+
+	// HaveNodeKey is whether the current profile has a node key configured.
+	HaveNodeKey bool `json:",omitempty"`
 
 	AuthURL      string       // current URL provided by control to authorize client
 	TailscaleIPs []netip.Addr // Tailscale IP(s) assigned to this node
@@ -90,15 +94,14 @@ type TKAKey struct {
 	Votes    uint
 }
 
-// TKAFilteredPeer describes a peer which was removed from the netmap
-// (i.e. no connectivity) because it failed tailnet lock
-// checks.
-type TKAFilteredPeer struct {
-	Name         string // DNS
-	ID           tailcfg.NodeID
-	StableID     tailcfg.StableNodeID
-	TailscaleIPs []netip.Addr // Tailscale IP(s) assigned to this node
-	NodeKey      key.NodePublic
+// TKAPeer describes a peer and its network lock details.
+type TKAPeer struct {
+	Name             string // DNS
+	ID               tailcfg.NodeID
+	StableID         tailcfg.StableNodeID
+	TailscaleIPs     []netip.Addr // Tailscale IP(s) assigned to this node
+	NodeKey          key.NodePublic
+	NodeKeySignature tka.NodeKeySignature
 }
 
 // NetworkLockStatus represents whether network-lock is enabled,
@@ -123,14 +126,21 @@ type NetworkLockStatus struct {
 	// NodeKeySigned is true if our node is authorized by network-lock.
 	NodeKeySigned bool
 
+	// NodeKeySignature is the current signature of this node's key.
+	NodeKeySignature *tka.NodeKeySignature
+
 	// TrustedKeys describes the keys currently trusted to make changes
 	// to network-lock.
 	TrustedKeys []TKAKey
 
+	// VisiblePeers describes peers which are visible in the netmap that
+	// have valid Tailnet Lock signatures signatures.
+	VisiblePeers []*TKAPeer
+
 	// FilteredPeers describes peers which were removed from the netmap
 	// (i.e. no connectivity) because they failed tailnet lock
 	// checks.
-	FilteredPeers []*TKAFilteredPeer
+	FilteredPeers []*TKAPeer
 
 	// StateID is a nonce associated with the network lock authority,
 	// generated upon enablement. This field is not populated if the
@@ -188,14 +198,21 @@ func (s *Status) Peers() []key.NodePublic {
 }
 
 type PeerStatusLite struct {
-	// TxBytes/RxBytes is the total number of bytes transmitted to/received from this peer.
-	TxBytes, RxBytes int64
-	// LastHandshake is the last time a handshake succeeded with this peer.
-	// (Or we got key confirmation via the first data message,
-	// which is approximately the same thing.)
-	LastHandshake time.Time
 	// NodeKey is this peer's public node key.
 	NodeKey key.NodePublic
+
+	// TxBytes/RxBytes are the total number of bytes transmitted to/received
+	// from this peer.
+	TxBytes, RxBytes int64
+
+	// LastHandshake is the last time a handshake succeeded with this peer. (Or
+	// we got key confirmation via the first data message, which is
+	// approximately the same thing.)
+	//
+	// The time.Time zero value means that no handshake has succeeded, at least
+	// since this peer was last known to WireGuard. (Tailscale removes peers
+	// from the wireguard peer that are idle.)
+	LastHandshake time.Time
 }
 
 // PeerStatus describes a peer node and its current state.
@@ -259,6 +276,10 @@ type PeerStatus struct {
 	//    "https://tailscale.com/cap/is-admin"
 	//    "https://tailscale.com/cap/file-sharing"
 	//    "funnel"
+	//
+	// Deprecated: use CapMap instead. See https://github.com/tailscale/tailscale/issues/11508
+	// Every value is Capabilities is also a key in CapMap, even if it
+	// has no values in that map.
 	Capabilities []tailcfg.NodeCapability `json:",omitempty"`
 
 	// CapMap is a map of capabilities to their values.
@@ -299,7 +320,7 @@ type PeerStatus struct {
 
 // HasCap reports whether ps has the given capability.
 func (ps *PeerStatus) HasCap(cap tailcfg.NodeCapability) bool {
-	return ps.CapMap.Contains(cap) || slices.Contains(ps.Capabilities, cap)
+	return ps.CapMap.Contains(cap)
 }
 
 // IsTagged reports whether ps is tagged.
@@ -485,6 +506,12 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	if t := st.KeyExpiry; t != nil {
 		e.KeyExpiry = ptr.To(*t)
 	}
+	if v := st.CapMap; v != nil {
+		e.CapMap = v
+	}
+	if v := st.Capabilities; v != nil {
+		e.Capabilities = v
+	}
 	e.Location = st.Location
 }
 
@@ -623,6 +650,8 @@ func osEmoji(os string) string {
 		return "🐡"
 	case "illumos":
 		return "☀️"
+	case "solaris":
+		return "🌤️"
 	}
 	return "👽"
 }

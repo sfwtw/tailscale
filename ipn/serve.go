@@ -6,20 +6,42 @@ package ipn
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"net"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/ipproto"
+	"tailscale.com/util/mak"
+	"tailscale.com/util/set"
 )
 
 // ServeConfigKey returns a StateKey that stores the
 // JSON-encoded ServeConfig for a config profile.
 func ServeConfigKey(profileID ProfileID) StateKey {
 	return StateKey("_serve/" + profileID)
+}
+
+// ServiceConfig contains the config information for a single service.
+// it contains a bool to indicate if the service is in Tun mode (L3 forwarding).
+// If the service is not in Tun mode, the service is configured by the L4 forwarding
+// (TCP ports) and/or the L7 forwarding (http handlers) information.
+type ServiceConfig struct {
+	// TCP are the list of TCP port numbers that tailscaled should handle for
+	// the Tailscale IP addresses. (not subnet routers, etc)
+	TCP map[uint16]*TCPPortHandler `json:",omitempty"`
+
+	// Web maps from "$SNI_NAME:$PORT" to a set of HTTP handlers
+	// keyed by mount point ("/", "/foo", etc)
+	Web map[HostPort]*WebServerConfig `json:",omitempty"`
+
+	// Tun determines if the service should be using L3 forwarding (Tun mode).
+	Tun bool `json:",omitempty"`
 }
 
 // ServeConfig is the JSON type stored in the StateStore for
@@ -33,16 +55,20 @@ type ServeConfig struct {
 	// keyed by mount point ("/", "/foo", etc)
 	Web map[HostPort]*WebServerConfig `json:",omitempty"`
 
+	// Services maps from service name (in the form "svc:dns-label") to a ServiceConfig.
+	// Which describes the L3, L4, and L7 forwarding information for the service.
+	Services map[tailcfg.ServiceName]*ServiceConfig `json:",omitempty"`
+
 	// AllowFunnel is the set of SNI:port values for which funnel
 	// traffic is allowed, from trusted ingress peers.
 	AllowFunnel map[HostPort]bool `json:",omitempty"`
 
-	// Foreground is a map of an IPN Bus session ID to an alternate foreground
-	// serve config that's valid for the life of that WatchIPNBus session ID.
-	// This. This allows the config to specify ephemeral configs that are
-	// used in the CLI's foreground mode to ensure ungraceful shutdowns
-	// of either the client or the LocalBackend does not expose ports
-	// that users are not aware of.
+	// Foreground is a map of an IPN Bus session ID to an alternate foreground serve config that's valid for the
+	// life of that WatchIPNBus session ID. This allows the config to specify ephemeral configs that are used
+	// in the CLI's foreground mode to ensure ungraceful shutdowns of either the client or the LocalBackend does not
+	// expose ports that users are not aware of. In practice this contains any serve config set via 'tailscale
+	// serve' command run without the '--bg' flag. ServeConfig contained by Foreground is not expected itself to contain
+	// another Foreground block.
 	Foreground map[string]*ServeConfig `json:",omitempty"`
 
 	// ETag is the checksum of the serve config that's populated
@@ -234,14 +260,136 @@ func (sc *ServeConfig) IsServingHTTP(port uint16) bool {
 	return sc.TCP[port].HTTP
 }
 
+// FindConfig finds a config that contains the given port, which can be
+// the top level background config or an inner foreground one.
+// The second result is true if it's foreground.
+func (sc *ServeConfig) FindConfig(port uint16) (*ServeConfig, bool) {
+	if sc == nil {
+		return nil, false
+	}
+	if _, ok := sc.TCP[port]; ok {
+		return sc, false
+	}
+	for _, sc := range sc.Foreground {
+		if _, ok := sc.TCP[port]; ok {
+			return sc, true
+		}
+	}
+	return nil, false
+}
+
+// SetWebHandler sets the given HTTPHandler at the specified host, port,
+// and mount in the serve config. sc.TCP is also updated to reflect web
+// serving usage of the given port.
+func (sc *ServeConfig) SetWebHandler(handler *HTTPHandler, host string, port uint16, mount string, useTLS bool) {
+	if sc == nil {
+		sc = new(ServeConfig)
+	}
+	mak.Set(&sc.TCP, port, &TCPPortHandler{HTTPS: useTLS, HTTP: !useTLS})
+
+	hp := HostPort(net.JoinHostPort(host, strconv.Itoa(int(port))))
+	if _, ok := sc.Web[hp]; !ok {
+		mak.Set(&sc.Web, hp, new(WebServerConfig))
+	}
+	mak.Set(&sc.Web[hp].Handlers, mount, handler)
+
+	// TODO(tylersmalley): handle multiple web handlers from foreground mode
+	for k, v := range sc.Web[hp].Handlers {
+		if v == handler {
+			continue
+		}
+		// If the new mount point ends in / and another mount point
+		// shares the same prefix, remove the other handler.
+		// (e.g. /foo/ overwrites /foo)
+		// The opposite example is also handled.
+		m1 := strings.TrimSuffix(mount, "/")
+		m2 := strings.TrimSuffix(k, "/")
+		if m1 == m2 {
+			delete(sc.Web[hp].Handlers, k)
+		}
+	}
+}
+
+// SetTCPForwarding sets the fwdAddr (IP:port form) to which to forward
+// connections from the given port. If terminateTLS is true, TLS connections
+// are terminated with only the given host name permitted before passing them
+// to the fwdAddr.
+func (sc *ServeConfig) SetTCPForwarding(port uint16, fwdAddr string, terminateTLS bool, host string) {
+	if sc == nil {
+		sc = new(ServeConfig)
+	}
+	mak.Set(&sc.TCP, port, &TCPPortHandler{TCPForward: fwdAddr})
+	if terminateTLS {
+		sc.TCP[port].TerminateTLS = host
+	}
+}
+
+// SetFunnel sets the sc.AllowFunnel value for the given host and port.
+func (sc *ServeConfig) SetFunnel(host string, port uint16, setOn bool) {
+	if sc == nil {
+		sc = new(ServeConfig)
+	}
+	hp := HostPort(net.JoinHostPort(host, strconv.Itoa(int(port))))
+
+	// TODO(tylersmalley): should ensure there is no other conflicting funnel
+	// TODO(tylersmalley): add error handling for if toggling for existing sc
+	if setOn {
+		mak.Set(&sc.AllowFunnel, hp, true)
+	} else if _, exists := sc.AllowFunnel[hp]; exists {
+		delete(sc.AllowFunnel, hp)
+		// Clear map mostly for testing.
+		if len(sc.AllowFunnel) == 0 {
+			sc.AllowFunnel = nil
+		}
+	}
+}
+
+// RemoveWebHandler deletes the web handlers at all of the given mount points
+// for the provided host and port in the serve config. If cleanupFunnel is
+// true, this also removes the funnel value for this port if no handlers remain.
+func (sc *ServeConfig) RemoveWebHandler(host string, port uint16, mounts []string, cleanupFunnel bool) {
+	hp := HostPort(net.JoinHostPort(host, strconv.Itoa(int(port))))
+
+	// Delete existing handler, then cascade delete if empty.
+	for _, m := range mounts {
+		delete(sc.Web[hp].Handlers, m)
+	}
+	if len(sc.Web[hp].Handlers) == 0 {
+		delete(sc.Web, hp)
+		delete(sc.TCP, port)
+		if cleanupFunnel {
+			delete(sc.AllowFunnel, hp) // disable funnel if no mounts remain for the port
+		}
+	}
+
+	// Clear empty maps, mostly for testing.
+	if len(sc.Web) == 0 {
+		sc.Web = nil
+	}
+	if len(sc.TCP) == 0 {
+		sc.TCP = nil
+	}
+	if len(sc.AllowFunnel) == 0 {
+		sc.AllowFunnel = nil
+	}
+}
+
+// RemoveTCPForwarding deletes the TCP forwarding configuration for the given
+// port from the serve config.
+func (sc *ServeConfig) RemoveTCPForwarding(port uint16) {
+	delete(sc.TCP, port)
+	if len(sc.TCP) == 0 {
+		sc.TCP = nil
+	}
+}
+
 // IsFunnelOn reports whether if ServeConfig is currently allowing funnel
 // traffic for any host:port.
 //
 // View version of ServeConfig.IsFunnelOn.
 func (v ServeConfigView) IsFunnelOn() bool { return v.ж.IsFunnelOn() }
 
-// IsFunnelOn reports whether if ServeConfig is currently allowing funnel
-// traffic for any host:port.
+// IsFunnelOn reports whether any funnel endpoint is currently enabled for this node.
 func (sc *ServeConfig) IsFunnelOn() bool {
 	if sc == nil {
 		return false
@@ -251,25 +399,39 @@ func (sc *ServeConfig) IsFunnelOn() bool {
 			return true
 		}
 	}
+	for _, conf := range sc.Foreground {
+		if conf.IsFunnelOn() {
+			return true
+		}
+	}
 	return false
 }
 
 // CheckFunnelAccess checks whether Funnel access is allowed for the given node
 // and port.
 // It checks:
-//  1. HTTPS is enabled on the Tailnet
+//  1. HTTPS is enabled on the tailnet
 //  2. the node has the "funnel" nodeAttr
 //  3. the port is allowed for Funnel
 //
 // The node arg should be the ipnstate.Status.Self node.
 func CheckFunnelAccess(port uint16, node *ipnstate.PeerStatus) error {
+	if err := NodeCanFunnel(node); err != nil {
+		return err
+	}
+	return CheckFunnelPort(port, node)
+}
+
+// NodeCanFunnel returns an error if the given node is not configured to allow
+// for Tailscale Funnel usage.
+func NodeCanFunnel(node *ipnstate.PeerStatus) error {
 	if !node.HasCap(tailcfg.CapabilityHTTPS) {
 		return errors.New("Funnel not available; HTTPS must be enabled. See https://tailscale.com/s/https.")
 	}
 	if !node.HasCap(tailcfg.NodeAttrFunnel) {
 		return errors.New("Funnel not available; \"funnel\" node attribute not set. See https://tailscale.com/s/no-funnel.")
 	}
-	return CheckFunnelPort(port, node)
+	return nil
 }
 
 // CheckFunnelPort checks whether the given port is allowed for Funnel.
@@ -311,7 +473,7 @@ func CheckFunnelPort(wantedPort uint16, node *ipnstate.PeerStatus) error {
 		break
 	}
 	if portsStr == "" {
-		for _, attr := range node.Capabilities {
+		for attr := range node.CapMap {
 			attr := string(attr)
 			if !strings.HasPrefix(attr, string(tailcfg.CapabilityFunnelPorts)) {
 				continue
@@ -355,58 +517,132 @@ func CheckFunnelPort(wantedPort uint16, node *ipnstate.PeerStatus) error {
 	return deny(portsStr)
 }
 
-// RangeOverTCPs ranges over both background and foreground TCPs.
-// If the returned bool from the given f is false, then this function stops
-// iterating immediately and does not check other foreground configs.
-func (v ServeConfigView) RangeOverTCPs(f func(port uint16, _ TCPPortHandlerView) bool) {
-	parentCont := true
-	v.TCP().Range(func(k uint16, v TCPPortHandlerView) (cont bool) {
-		parentCont = f(k, v)
-		return parentCont
-	})
-	v.Foreground().Range(func(k string, v ServeConfigView) (cont bool) {
-		if !parentCont {
-			return false
-		}
-		v.TCP().Range(func(k uint16, v TCPPortHandlerView) (cont bool) {
-			parentCont = f(k, v)
-			return parentCont
-		})
-		return parentCont
-	})
+// ExpandProxyTargetValue expands the supported target values to be proxied
+// allowing for input values to be a port number, a partial URL, or a full URL
+// including a path.
+//
+// examples:
+//   - 3000
+//   - localhost:3000
+//   - tcp://localhost:3000
+//   - http://localhost:3000
+//   - https://localhost:3000
+//   - https-insecure://localhost:3000
+//   - https-insecure://localhost:3000/foo
+func ExpandProxyTargetValue(target string, supportedSchemes []string, defaultScheme string) (string, error) {
+	const host = "127.0.0.1"
+
+	// support target being a port number
+	if port, err := strconv.ParseUint(target, 10, 16); err == nil {
+		return fmt.Sprintf("%s://%s:%d", defaultScheme, host, port), nil
+	}
+
+	// prepend scheme if not present
+	if !strings.Contains(target, "://") {
+		target = defaultScheme + "://" + target
+	}
+
+	// make sure we can parse the target
+	u, err := url.ParseRequestURI(target)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL %w", err)
+	}
+
+	// ensure a supported scheme
+	if !slices.Contains(supportedSchemes, u.Scheme) {
+		return "", fmt.Errorf("must be a URL starting with one of the supported schemes: %v", supportedSchemes)
+	}
+
+	// validate the host.
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1":
+	default:
+		return "", errors.New("only localhost or 127.0.0.1 proxies are currently supported")
+	}
+
+	// validate the port
+	port, err := strconv.ParseUint(u.Port(), 10, 16)
+	if err != nil || port == 0 {
+		return "", fmt.Errorf("invalid port %q", u.Port())
+	}
+
+	u.Host = fmt.Sprintf("%s:%d", u.Hostname(), port)
+
+	return u.String(), nil
 }
 
-// RangeOverWebs ranges over both background and foreground Webs.
-// If the returned bool from the given f is false, then this function stops
-// iterating immediately and does not check other foreground configs.
-func (v ServeConfigView) RangeOverWebs(f func(_ HostPort, conf WebServerConfigView) bool) {
-	parentCont := true
-	v.Web().Range(func(k HostPort, v WebServerConfigView) (cont bool) {
-		parentCont = f(k, v)
-		return parentCont
-	})
-	v.Foreground().Range(func(k string, v ServeConfigView) (cont bool) {
-		if !parentCont {
-			return false
+// TCPs returns an iterator over both background and foreground TCP
+// listeners.
+//
+// The key is the port number.
+func (v ServeConfigView) TCPs() iter.Seq2[uint16, TCPPortHandlerView] {
+	return func(yield func(uint16, TCPPortHandlerView) bool) {
+		for k, v := range v.TCP().All() {
+			if !yield(k, v) {
+				return
+			}
 		}
-		v.Web().Range(func(k HostPort, v WebServerConfigView) (cont bool) {
-			parentCont = f(k, v)
-			return parentCont
-		})
-		return parentCont
-	})
+		for _, conf := range v.Foreground().All() {
+			for k, v := range conf.TCP().All() {
+				if !yield(k, v) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// Webs returns an iterator over both background and foreground Web configurations.
+func (v ServeConfigView) Webs() iter.Seq2[HostPort, WebServerConfigView] {
+	return func(yield func(HostPort, WebServerConfigView) bool) {
+		for k, v := range v.Web().All() {
+			if !yield(k, v) {
+				return
+			}
+		}
+		for _, conf := range v.Foreground().All() {
+			for k, v := range conf.Web().All() {
+				if !yield(k, v) {
+					return
+				}
+			}
+		}
+		for _, service := range v.Services().All() {
+			for k, v := range service.Web().All() {
+				if !yield(k, v) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// FindServiceTCP return the TCPPortHandlerView for the given service name and port.
+func (v ServeConfigView) FindServiceTCP(svcName tailcfg.ServiceName, port uint16) (res TCPPortHandlerView, ok bool) {
+	svcCfg, ok := v.Services().GetOk(svcName)
+	if !ok {
+		return res, ok
+	}
+	return svcCfg.TCP().GetOk(port)
+}
+
+func (v ServeConfigView) FindServiceWeb(svcName tailcfg.ServiceName, hp HostPort) (res WebServerConfigView, ok bool) {
+	if svcCfg, ok := v.Services().GetOk(svcName); ok {
+		if res, ok := svcCfg.Web().GetOk(hp); ok {
+			return res, ok
+		}
+	}
+	return res, ok
 }
 
 // FindTCP returns the first TCP that matches with the given port. It
 // prefers a foreground match first followed by a background search if none
 // existed.
 func (v ServeConfigView) FindTCP(port uint16) (res TCPPortHandlerView, ok bool) {
-	v.Foreground().Range(func(_ string, v ServeConfigView) (cont bool) {
-		res, ok = v.TCP().GetOk(port)
-		return !ok
-	})
-	if ok {
-		return res, ok
+	for _, conf := range v.Foreground().All() {
+		if res, ok := conf.TCP().GetOk(port); ok {
+			return res, ok
+		}
 	}
 	return v.TCP().GetOk(port)
 }
@@ -415,12 +651,10 @@ func (v ServeConfigView) FindTCP(port uint16) (res TCPPortHandlerView, ok bool) 
 // prefers a foreground match first followed by a background search if none
 // existed.
 func (v ServeConfigView) FindWeb(hp HostPort) (res WebServerConfigView, ok bool) {
-	v.Foreground().Range(func(_ string, v ServeConfigView) (cont bool) {
-		res, ok = v.Web().GetOk(hp)
-		return !ok
-	})
-	if ok {
-		return res, ok
+	for _, conf := range v.Foreground().All() {
+		if res, ok := conf.Web().GetOk(hp); ok {
+			return res, ok
+		}
 	}
 	return v.Web().GetOk(hp)
 }
@@ -428,28 +662,90 @@ func (v ServeConfigView) FindWeb(hp HostPort) (res WebServerConfigView, ok bool)
 // HasAllowFunnel returns whether this config has at least one AllowFunnel
 // set in the background or foreground configs.
 func (v ServeConfigView) HasAllowFunnel() bool {
-	return v.AllowFunnel().Len() > 0 || func() bool {
-		var exists bool
-		v.Foreground().Range(func(k string, v ServeConfigView) (cont bool) {
-			exists = v.AllowFunnel().Len() > 0
-			return !exists
-		})
-		return exists
-	}()
+	if v.AllowFunnel().Len() > 0 {
+		return true
+	}
+	for _, conf := range v.Foreground().All() {
+		if conf.AllowFunnel().Len() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
-// FindFunnel reports whether target exists in in either the background AllowFunnel
+// FindFunnel reports whether target exists in either the background AllowFunnel
 // or any of the foreground configs.
 func (v ServeConfigView) HasFunnelForTarget(target HostPort) bool {
 	if v.AllowFunnel().Get(target) {
 		return true
 	}
-	var exists bool
-	v.Foreground().Range(func(_ string, v ServeConfigView) (cont bool) {
-		if exists = v.AllowFunnel().Get(target); exists {
-			return false
+	for _, conf := range v.Foreground().All() {
+		if conf.AllowFunnel().Get(target) {
+			return true
 		}
-		return true
-	})
-	return exists
+	}
+	return false
+}
+
+// CheckValidServicesConfig reports whether the ServeConfig has
+// invalid service configurations.
+func (sc *ServeConfig) CheckValidServicesConfig() error {
+	for svcName, service := range sc.Services {
+		if err := service.checkValidConfig(); err != nil {
+			return fmt.Errorf("invalid service configuration for %q: %w", svcName, err)
+		}
+	}
+	return nil
+}
+
+// ServicePortRange returns the list of tailcfg.ProtoPortRange that represents
+// the proto/ports pairs that are being served by the service.
+//
+// Right now Tun mode is the only thing supports UDP, otherwise serve only supports TCP.
+func (v ServiceConfigView) ServicePortRange() []tailcfg.ProtoPortRange {
+	if v.Tun() {
+		// If the service is in Tun mode, means service accept TCP/UDP on all ports.
+		return []tailcfg.ProtoPortRange{{Ports: tailcfg.PortRangeAny}}
+	}
+	tcp := int(ipproto.TCP)
+
+	// Deduplicate the ports.
+	servePorts := make(set.Set[uint16])
+	for port := range v.TCP().All() {
+		if port > 0 {
+			servePorts.Add(uint16(port))
+		}
+	}
+	dedupedServePorts := servePorts.Slice()
+	slices.Sort(dedupedServePorts)
+
+	var ranges []tailcfg.ProtoPortRange
+	for _, p := range dedupedServePorts {
+		if n := len(ranges); n > 0 && p == ranges[n-1].Ports.Last+1 {
+			ranges[n-1].Ports.Last = p
+			continue
+		}
+		ranges = append(ranges, tailcfg.ProtoPortRange{
+			Proto: tcp,
+			Ports: tailcfg.PortRange{
+				First: p,
+				Last:  p,
+			},
+		})
+	}
+	return ranges
+}
+
+// ErrServiceConfigHasBothTCPAndTun signals that a service
+// in Tun mode cannot also has TCP or Web handlers set.
+var ErrServiceConfigHasBothTCPAndTun = errors.New("the VIP Service configuration can not set TUN at the same time as TCP or Web")
+
+// checkValidConfig checks if the service configuration is valid.
+// Currently, the only invalid configuration is when the service is in Tun mode
+// and has TCP or Web handlers.
+func (v *ServiceConfig) checkValidConfig() error {
+	if v.Tun && (len(v.TCP) > 0 || len(v.Web) > 0) {
+		return ErrServiceConfigHasBothTCPAndTun
+	}
+	return nil
 }
