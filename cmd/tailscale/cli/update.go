@@ -19,8 +19,8 @@ import (
 
 var updateCmd = &ffcli.Command{
 	Name:       "update",
-	ShortUsage: "update",
-	ShortHelp:  "[BETA] Update Tailscale to the latest/different version",
+	ShortUsage: "tailscale update",
+	ShortHelp:  "Update Tailscale to the latest/different version",
 	Exec:       runUpdate,
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("update")
@@ -33,11 +33,13 @@ var updateCmd = &ffcli.Command{
 		//  - Alpine (and other apk-based distros)
 		//  - FreeBSD (and other pkg-based distros)
 		//  - Unraid/QNAP/Synology
+		//  - macOS
 		if distro.Get() != distro.Arch &&
 			distro.Get() != distro.Alpine &&
 			distro.Get() != distro.QNAP &&
 			distro.Get() != distro.Synology &&
-			runtime.GOOS != "freebsd" {
+			runtime.GOOS != "freebsd" &&
+			runtime.GOOS != "darwin" {
 			fs.StringVar(&updateArgs.track, "track", "", `which track to check for updates: "stable" or "unstable" (dev); empty means same as current`)
 			fs.StringVar(&updateArgs.version, "version", "", `explicit version to update/downgrade to`)
 		}
@@ -59,12 +61,9 @@ func runUpdate(ctx context.Context, args []string) error {
 	if updateArgs.version != "" && updateArgs.track != "" {
 		return errors.New("cannot specify both --version and --track")
 	}
-	ver := updateArgs.version
-	if updateArgs.track != "" {
-		ver = updateArgs.track
-	}
 	err := clientupdate.Update(clientupdate.Arguments{
-		Version: ver,
+		Version: updateArgs.version,
+		Track:   updateArgs.track,
 		Logf:    func(f string, a ...any) { printf(f+"\n", a...) },
 		Stdout:  Stdout,
 		Stderr:  Stderr,

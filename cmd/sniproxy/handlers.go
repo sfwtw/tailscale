@@ -7,12 +7,12 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"slices"
 
-	"inet.af/tcpproxy"
+	"github.com/inetaf/tcpproxy"
 	"tailscale.com/net/netutil"
 )
 
@@ -47,7 +47,7 @@ func (h *tcpRoundRobinHandler) Handle(c net.Conn) {
 		return netutil.NewOneConnListener(c, nil), nil
 	}
 
-	dest := h.To[rand.Intn(len(h.To))]
+	dest := h.To[rand.IntN(len(h.To))]
 	dial := &tcpproxy.DialProxy{
 		Addr:        fmt.Sprintf("%s:%s", dest, port),
 		DialContext: h.DialContext,

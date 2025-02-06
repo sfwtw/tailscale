@@ -18,6 +18,12 @@ import (
 // field without it being dropped.
 type Bool string
 
+// NewBool constructs a new Bool value equal to b. The returned Bool is set,
+// unless Set("") or Clear() methods are called.
+func NewBool(b bool) Bool {
+	return Bool(strconv.FormatBool(b))
+}
+
 func (b *Bool) Set(v bool) {
 	*b = Bool(strconv.FormatBool(v))
 }
@@ -98,4 +104,30 @@ func (b *Bool) UnmarshalJSON(j []byte) error {
 		return fmt.Errorf("invalid opt.Bool value %q", j)
 	}
 	return nil
+}
+
+// BoolFlag is a wrapper for Bool that implements [flag.Value].
+type BoolFlag struct {
+	*Bool
+}
+
+// Set the value of b, using any value supported by [strconv.ParseBool].
+func (b *BoolFlag) Set(s string) error {
+	v, err := strconv.ParseBool(s)
+	if err != nil {
+		return err
+	}
+	b.Bool.Set(v)
+	return nil
+}
+
+// String returns "true" or "false" if the value is set, or an empty string otherwise.
+func (b *BoolFlag) String() string {
+	if b == nil || b.Bool == nil {
+		return ""
+	}
+	if v, ok := b.Bool.Get(); ok {
+		return strconv.FormatBool(v)
+	}
+	return ""
 }

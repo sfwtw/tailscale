@@ -4,7 +4,7 @@
 package netmap
 
 import (
-	"fmt"
+	"cmp"
 	"net/netip"
 	"reflect"
 	"slices"
@@ -13,7 +13,6 @@ import (
 
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/ptr"
-	"tailscale.com/util/cmpx"
 )
 
 // NodeMutation is the common interface for types that describe
@@ -35,7 +34,7 @@ type NodeMutationDERPHome struct {
 }
 
 func (m NodeMutationDERPHome) Apply(n *tailcfg.Node) {
-	n.DERP = fmt.Sprintf("127.3.3.40:%v", m.DERPRegion)
+	n.HomeDERP = m.DERPRegion
 }
 
 // NodeMutation is a NodeMutation that says a node's endpoints have changed.
@@ -72,8 +71,8 @@ func (m NodeMutationLastSeen) Apply(n *tailcfg.Node) {
 
 var peerChangeFields = sync.OnceValue(func() []reflect.StructField {
 	var fields []reflect.StructField
-	rt := reflect.TypeOf((*tailcfg.PeerChange)(nil)).Elem()
-	for i := 0; i < rt.NumField(); i++ {
+	rt := reflect.TypeFor[tailcfg.PeerChange]()
+	for i := range rt.NumField() {
 		fields = append(fields, rt.Field(i))
 	}
 	return fields
@@ -139,7 +138,7 @@ func MutationsFromMapResponse(res *tailcfg.MapResponse, now time.Time) (ret []No
 		}
 	}
 	slices.SortStableFunc(ret, func(a, b NodeMutation) int {
-		return cmpx.Compare(a.NodeIDBeingMutated(), b.NodeIDBeingMutated())
+		return cmp.Compare(a.NodeIDBeingMutated(), b.NodeIDBeingMutated())
 	})
 	return ret, true
 }
@@ -176,5 +175,7 @@ func mapResponseContainsNonPatchFields(res *tailcfg.MapResponse) bool {
 		// PeersChanged to PeersChangedPatch in patchifyPeersChanged before this
 		// function is called, so it should never be set anyway. But for
 		// completedness, and for tests, check it too:
-		res.PeersChanged != nil
+		res.PeersChanged != nil ||
+		res.DefaultAutoUpdate != "" ||
+		res.MaxKeyDuration > 0
 }

@@ -4,14 +4,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"tailscale.com/net/stun"
+	"tailscale.com/derp/derphttp"
 	"tailscale.com/tstest/deptest"
 )
 
@@ -37,38 +37,6 @@ func TestProdAutocertHostPolicy(t *testing.T) {
 			t.Errorf("f(%q) = %v; want %v", tt.in, got, tt.wantOK)
 		}
 	}
-}
-
-func BenchmarkServerSTUN(b *testing.B) {
-	b.ReportAllocs()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer pc.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go serverSTUNListener(ctx, pc.(*net.UDPConn))
-	addr := pc.LocalAddr().(*net.UDPAddr)
-
-	var resBuf [1500]byte
-	cc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	tx := stun.NewTxID()
-	req := stun.Request(tx)
-	for i := 0; i < b.N; i++ {
-		if _, err := cc.WriteToUDP(req, addr); err != nil {
-			b.Fatal(err)
-		}
-		_, _, err := cc.ReadFromUDP(resBuf[:])
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-
 }
 
 func TestNoContent(t *testing.T) {
@@ -110,20 +78,20 @@ func TestNoContent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req, _ := http.NewRequest("GET", "https://localhost/generate_204", nil)
 			if tt.input != "" {
-				req.Header.Set(noContentChallengeHeader, tt.input)
+				req.Header.Set(derphttp.NoContentChallengeHeader, tt.input)
 			}
 			w := httptest.NewRecorder()
-			serveNoContent(w, req)
+			derphttp.ServeNoContent(w, req)
 			resp := w.Result()
 
 			if tt.want == "" {
-				if h, found := resp.Header[noContentResponseHeader]; found {
+				if h, found := resp.Header[derphttp.NoContentResponseHeader]; found {
 					t.Errorf("got %+v; expected no response header", h)
 				}
 				return
 			}
 
-			if got := resp.Header.Get(noContentResponseHeader); got != tt.want {
+			if got := resp.Header.Get(derphttp.NoContentResponseHeader); got != tt.want {
 				t.Errorf("got %q; want %q", got, tt.want)
 			}
 		})
@@ -133,10 +101,83 @@ func TestNoContent(t *testing.T) {
 func TestDeps(t *testing.T) {
 	deptest.DepChecker{
 		BadDeps: map[string]string{
+			"testing":                            "do not use testing package in production code",
 			"gvisor.dev/gvisor/pkg/buffer":       "https://github.com/tailscale/tailscale/issues/9756",
 			"gvisor.dev/gvisor/pkg/cpuid":        "https://github.com/tailscale/tailscale/issues/9756",
 			"gvisor.dev/gvisor/pkg/tcpip":        "https://github.com/tailscale/tailscale/issues/9756",
 			"gvisor.dev/gvisor/pkg/tcpip/header": "https://github.com/tailscale/tailscale/issues/9756",
+			"tailscale.com/net/packet":           "not needed in derper",
+			"github.com/gaissmai/bart":           "not needed in derper",
+			"database/sql/driver":                "not needed in derper", // previously came in via github.com/google/uuid
 		},
 	}.Check(t)
+}
+
+func TestTemplate(t *testing.T) {
+	buf := &bytes.Buffer{}
+	err := homePageTemplate.Execute(buf, templateData{
+		ShowAbuseInfo: true,
+		Disabled:      true,
+		AllowDebug:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	str := buf.String()
+	if !strings.Contains(str, "If you suspect abuse") {
+		t.Error("Output is missing abuse mailto")
+	}
+	if !strings.Contains(str, "Tailscale Security Policies") {
+		t.Error("Output is missing Tailscale Security Policies link")
+	}
+	if !strings.Contains(str, "Status:") {
+		t.Error("Output is missing disabled status")
+	}
+	if !strings.Contains(str, "Debug info") {
+		t.Error("Output is missing debug info")
+	}
+}
+
+func TestCheckMeshKey(t *testing.T) {
+	testCases := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "KeyOkay",
+			input:   "f1ffafffffffffffffffffffffffffffffffffffffffffffffffff2ffffcfff6",
+			want:    "f1ffafffffffffffffffffffffffffffffffffffffffffffffffff2ffffcfff6",
+			wantErr: false,
+		},
+		{
+			name:    "TrimKeyOkay",
+			input:   "  f1ffafffffffffffffffffffffffffffffffffffffffffffffffff2ffffcfff6  ",
+			want:    "f1ffafffffffffffffffffffffffffffffffffffffffffffffffff2ffffcfff6",
+			wantErr: false,
+		},
+		{
+			name:    "NotAKey",
+			input:   "zzthisisnotakey",
+			want:    "",
+			wantErr: true,
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			k, err := checkMeshKey(tt.input)
+			if err != nil && !tt.wantErr {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if k != tt.want && err == nil {
+				t.Errorf("want: %s doesn't match expected: %s", tt.want, k)
+			}
+
+		})
+	}
+
 }
